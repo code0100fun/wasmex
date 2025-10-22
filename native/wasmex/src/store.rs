@@ -10,7 +10,7 @@ use wasmtime::{
     AsContext, AsContextMut, Engine, Store, StoreContext, StoreContextMut, StoreLimits,
     StoreLimitsBuilder,
 };
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, ResourceTable};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 #[derive(Debug, NifStruct)]

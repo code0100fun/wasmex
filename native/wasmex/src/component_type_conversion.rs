@@ -1,11 +1,20 @@
 use rustler::types::atom;
 use rustler::types::tuple::{self, make_tuple};
-use rustler::{Encoder, Error, Term, TermType};
+use rustler::{Encoder, Error, ResourceArc, Term, TermType};
 use std::collections::HashMap;
-use wasmtime::component::{Type, Val};
+use std::sync::Mutex;
+use wasmtime::component::{ResourceAny, Type, Val};
 use wit_parser::{Resolve, Type as WitType, TypeDef, TypeDefKind};
 
 use crate::atoms;
+
+/// Wrapper for ResourceAny to make it passable between Elixir and Rust
+pub struct ComponentResourceAny {
+    pub inner: Mutex<Option<ResourceAny>>,
+}
+
+#[rustler::resource_impl()]
+impl rustler::Resource for ComponentResourceAny {}
 
 /// Convert an Elixir term to a Wasm value.
 ///
@@ -342,6 +351,19 @@ pub fn term_to_val(
 
             Ok(Val::Flags(flags))
         }
+        (TermType::Ref, Type::Own(_resource_type))
+        | (TermType::Ref, Type::Borrow(_resource_type)) => {
+            // Extract ResourceAny from the wrapper
+            let resource_arc = param_term.decode::<ResourceArc<ComponentResourceAny>>()?;
+            let resource_guard = resource_arc.inner.lock().map_err(|e| {
+                Error::Term(Box::new(format!("Could not lock resource mutex: {e}")))
+            })?;
+            let resource = resource_guard.as_ref().ok_or_else(|| {
+                Error::Term(Box::new("Resource has already been consumed".to_string()))
+            })?;
+            // Clone the ResourceAny so it can be reused
+            Ok(Val::Resource(*resource))
+        }
         (term_type, val_type) => {
             if path.is_empty() {
                 Err(Error::Term(Box::new(format!(
@@ -474,6 +496,13 @@ pub fn val_to_term<'a>(val: &Val, env: rustler::Env<'a>, mut path: Vec<String>) 
             }
 
             map_term
+        }
+        Val::Resource(resource) => {
+            // Wrap ResourceAny in ComponentResourceAny so it can be passed to Elixir
+            let resource_wrapper = ComponentResourceAny {
+                inner: Mutex::new(Some(*resource)),
+            };
+            ResourceArc::new(resource_wrapper).encode(env)
         }
         _ => {
             if path.is_empty() {

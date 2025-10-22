@@ -1,0 +1,17 @@
+package component:resource-test;
+
+interface types {
+    resource counter {
+        constructor(initial: u32);
+        increment: func() -> u32;
+        get: func() -> u32;
+        add: func(amount: u32) -> u32;
+    }
+
+    create-counter: func(initial: u32) -> counter;
+    use-counter: func(c: counter, amount: u32) -> u32;
+}
+
+world root {
+    export types;
+}

@@ -131,10 +131,18 @@ defmodule Wasmex.Components do
       {:error, 404}  # error case
       ```
 
-  ### Currently Unsupported Types
-
-  The following WIT type is not yet supported:
-  - Resources
+  - **Resource Types**
+    - `resource` (maps to opaque Elixir resources)
+      ```wit
+      resource file {
+        constructor(path: string);
+        read: func() -> list<u8>;
+      }
+      ```
+      ```elixir
+      # Resources are represented as opaque Elixir resource references
+      # They cannot be created directly but are returned from component functions
+      ```
 
   Support for the Component Model should be considered beta quality.
 

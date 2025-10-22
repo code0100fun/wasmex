@@ -344,7 +344,9 @@ fn execute_function(
                     return env.error_tuple("unable_to_return_exn_ref_type").encode(env)
                 }
                 Val::ContRef(_) => {
-                    return env.error_tuple("unable_to_return_cont_ref_type").encode(env)
+                    return env
+                        .error_tuple("unable_to_return_cont_ref_type")
+                        .encode(env)
                 }
             })
         }

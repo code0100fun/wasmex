@@ -1,0 +1,16 @@
+[package]
+name = "component_resource_test"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen-rt = { version = "0.39.0", features = ["bitflags"] }
+
+[package.metadata.component]
+package = "component:resource-test"
+
+[package.metadata.component.target]
+path = "wit"

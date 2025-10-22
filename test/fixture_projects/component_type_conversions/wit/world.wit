@@ -100,3 +100,4 @@ world root {
 
     export get-random-bytes: func(len: u32) -> list<u8>;
 }
+
