@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "component-stdio-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wit-bindgen-rt = { version = "0.41.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "component:stdio-test"
+
+[package.metadata.component.target]
+path = "wit"
+world = "stdio-test"

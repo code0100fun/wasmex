@@ -1,0 +1,7 @@
+package component:stdio-test;
+
+world stdio-test {
+  export print-hello: func() -> string;
+  export print-error: func() -> string;
+  export print-mixed: func() -> string;
+}
