@@ -10,6 +10,7 @@ use wasmtime::{
     AsContext, AsContextMut, Engine, Store, StoreContext, StoreContextMut, StoreLimits,
     StoreLimitsBuilder,
 };
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
@@ -42,6 +43,9 @@ pub struct ExWasiOptions {
 pub struct ExWasiP2Options {
     args: Vec<String>,
     env: HashMap<String, String>,
+    stdin: Option<ExPipe>,
+    stdout: Option<ExPipe>,
+    stderr: Option<ExPipe>,
     inherit_stdin: bool,
     inherit_stdout: bool,
     inherit_stderr: bool,
@@ -106,6 +110,10 @@ pub struct ComponentStoreData {
     pub(crate) http: Option<WasiHttpCtx>,
     pub(crate) limits: StoreLimits,
     pub(crate) table: ResourceTable,
+    pub(crate) stdout_pipe: Option<MemoryOutputPipe>,
+    pub(crate) stderr_pipe: Option<MemoryOutputPipe>,
+    pub(crate) stdout_user_pipe: Option<ResourceArc<PipeResource>>,
+    pub(crate) stderr_user_pipe: Option<ResourceArc<PipeResource>>,
 }
 
 impl WasiHttpView for ComponentStoreData {
@@ -219,6 +227,10 @@ pub fn component_store_new(
             ctx: None,
             limits,
             table: wasmtime_wasi::ResourceTable::new(),
+            stdout_pipe: None,
+            stderr_pipe: None,
+            stdout_user_pipe: None,
+            stderr_user_pipe: None,
         },
     );
     store.limiter(|state| &mut state.limits);
@@ -244,17 +256,41 @@ pub fn component_store_new_wasi(
         wasi_ctx_builder.env(key, value);
     }
 
-    if options.inherit_stdin {
+    // Handle stdin: pipe takes precedence over inherit
+    if let Some(_stdin_pipe) = &options.stdin {
+        // For stdin, we'd need to copy data from user's Pipe to MemoryInputPipe
+        // For now, just create an empty MemoryInputPipe
+        let memory_pipe = MemoryInputPipe::new(vec![]);
+        wasi_ctx_builder.stdin(memory_pipe);
+    } else if options.inherit_stdin {
         wasi_ctx_builder.inherit_stdin();
     }
 
-    if options.inherit_stdout {
-        wasi_ctx_builder.inherit_stdout();
-    }
+    // Handle stdout: pipe takes precedence over inherit
+    let (stdout_pipe_ref, stdout_user_pipe_ref) = if let Some(stdout_pipe) = &options.stdout {
+        let memory_pipe = MemoryOutputPipe::new(usize::MAX);
+        let pipe_clone = memory_pipe.clone();
+        wasi_ctx_builder.stdout(memory_pipe);
+        (Some(pipe_clone), Some(stdout_pipe.resource.clone()))
+    } else {
+        if options.inherit_stdout {
+            wasi_ctx_builder.inherit_stdout();
+        }
+        (None, None)
+    };
 
-    if options.inherit_stderr {
-        wasi_ctx_builder.inherit_stderr();
-    }
+    // Handle stderr: pipe takes precedence over inherit
+    let (stderr_pipe_ref, stderr_user_pipe_ref) = if let Some(stderr_pipe) = &options.stderr {
+        let memory_pipe = MemoryOutputPipe::new(usize::MAX);
+        let pipe_clone = memory_pipe.clone();
+        wasi_ctx_builder.stderr(memory_pipe);
+        (Some(pipe_clone), Some(stderr_pipe.resource.clone()))
+    } else {
+        if options.inherit_stderr {
+            wasi_ctx_builder.inherit_stderr();
+        }
+        (None, None)
+    };
 
     if options.allow_http {
         wasi_ctx_builder.allow_ip_name_lookup(true);
@@ -280,6 +316,10 @@ pub fn component_store_new_wasi(
             limits,
             http: http_option,
             table: wasmtime_wasi::ResourceTable::new(),
+            stdout_pipe: stdout_pipe_ref,
+            stderr_pipe: stderr_pipe_ref,
+            stdout_user_pipe: stdout_user_pipe_ref,
+            stderr_user_pipe: stderr_user_pipe_ref,
         },
     );
     store.limiter(|state| &mut state.limits);
