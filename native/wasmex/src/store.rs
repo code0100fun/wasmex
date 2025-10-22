@@ -10,8 +10,7 @@ use wasmtime::{
     AsContext, AsContextMut, Engine, Store, StoreContext, StoreContextMut, StoreLimits,
     StoreLimitsBuilder,
 };
-use wasmtime_wasi::p2::{IoView, WasiCtx, WasiView};
-use wasmtime_wasi::ResourceTable;
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView, ResourceTable};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 #[derive(Debug, NifStruct)]
@@ -109,21 +108,22 @@ pub struct ComponentStoreData {
     pub(crate) table: ResourceTable,
 }
 
-impl IoView for ComponentStoreData {
+impl WasiHttpView for ComponentStoreData {
+    fn ctx(&mut self) -> &mut WasiHttpCtx {
+        self.http.as_mut().expect("WasiHttpCtx is not set")
+    }
+
     fn table(&mut self) -> &mut ResourceTable {
         &mut self.table
     }
 }
 
-impl WasiHttpView for ComponentStoreData {
-    fn ctx(&mut self) -> &mut WasiHttpCtx {
-        self.http.as_mut().expect("WasiHttpCtx is not set")
-    }
-}
-
 impl WasiView for ComponentStoreData {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        self.ctx.as_mut().expect("WasiCtx is not set")
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: self.ctx.as_mut().expect("WasiCtx is not set"),
+            table: &mut self.table,
+        }
     }
 }
 
@@ -234,13 +234,15 @@ pub fn component_store_new_wasi(
     limits: Option<ExStoreLimits>,
     engine_resource: ResourceArc<EngineResource>,
 ) -> Result<ResourceArc<ComponentStoreResource>, rustler::Error> {
-    let wasi_env = &options
-        .env
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect::<Vec<_>>();
-    let mut wasi_ctx_builder = wasmtime_wasi::p2::WasiCtxBuilder::new();
-    wasi_ctx_builder.args(&options.args).envs(wasi_env);
+    let mut wasi_ctx_builder = WasiCtx::builder();
+
+    for arg in &options.args {
+        wasi_ctx_builder.arg(arg);
+    }
+
+    for (key, value) in &options.env {
+        wasi_ctx_builder.env(key, value);
+    }
 
     if options.inherit_stdin {
         wasi_ctx_builder.inherit_stdin();
@@ -255,9 +257,7 @@ pub fn component_store_new_wasi(
     }
 
     if options.allow_http {
-        wasi_ctx_builder
-            .inherit_network()
-            .allow_ip_name_lookup(true);
+        wasi_ctx_builder.allow_ip_name_lookup(true);
     }
 
     let engine = unwrap_engine(engine_resource)?;
