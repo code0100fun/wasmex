@@ -24,7 +24,7 @@ pub struct ExWasiPreopenOptions {
 #[derive(NifStruct)]
 #[module = "Wasmex.Pipe"]
 pub struct ExPipe {
-    resource: ResourceArc<PipeResource>,
+    pub resource: ResourceArc<PipeResource>,
 }
 
 #[derive(NifStruct)]

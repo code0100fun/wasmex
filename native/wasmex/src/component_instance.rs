@@ -601,6 +601,10 @@ pub fn call_http_handler<'a>(
             None
         };
 
+        // Extract user pipes from options for sync_pipe_output
+        let stdout_user_pipe = wasi_options.stdout.as_ref().map(|p| p.resource.clone());
+        let stderr_user_pipe = wasi_options.stderr.as_ref().map(|p| p.resource.clone());
+
         // Create fresh Store with new state
         let mut store = Store::new(
             &engine,
@@ -611,8 +615,8 @@ pub fn call_http_handler<'a>(
                 table: ResourceTable::new(),
                 stdout_pipe: stdout_pipe.clone(),
                 stderr_pipe: stderr_pipe.clone(),
-                stdout_user_pipe: None,
-                stderr_user_pipe: None,
+                stdout_user_pipe,
+                stderr_user_pipe,
             },
         );
         store.limiter(|state| &mut state.limits);
@@ -697,6 +701,38 @@ pub fn call_http_handler<'a>(
             .map_err(|e| Error::Term(Box::new(format!("Failed to read response body: {e}"))))?
             .to_bytes()
             .to_vec();
+
+        // Step 7: Sync output from internal pipes to user pipes before Store is dropped
+        {
+            use std::io::Write;
+            let store_data = store.data_mut();
+
+            // Sync stdout if both pipes are present
+            if let (Some(memory_pipe), Some(user_pipe)) = (
+                store_data.stdout_pipe.as_ref(),
+                store_data.stdout_user_pipe.as_ref(),
+            ) {
+                let bytes = memory_pipe.contents();
+                if !bytes.is_empty() {
+                    if let Ok(mut pipe) = user_pipe.pipe.lock() {
+                        let _ = pipe.write(&bytes);
+                    }
+                }
+            }
+
+            // Sync stderr if both pipes are present
+            if let (Some(memory_pipe), Some(user_pipe)) = (
+                store_data.stderr_pipe.as_ref(),
+                store_data.stderr_user_pipe.as_ref(),
+            ) {
+                let bytes = memory_pipe.contents();
+                if !bytes.is_empty() {
+                    if let Ok(mut pipe) = user_pipe.pipe.lock() {
+                        let _ = pipe.write(&bytes);
+                    }
+                }
+            }
+        }
 
         // Convert to Elixir binary
         let mut binary = rustler::OwnedBinary::new(body_bytes.len()).unwrap();
