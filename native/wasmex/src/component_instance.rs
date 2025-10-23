@@ -23,7 +23,7 @@ use rustler::Term;
 use wasmtime::Store;
 
 use wasmtime_wasi;
-use wasmtime_wasi_http;
+use wasmtime_wasi_http::{self, WasiHttpView};
 
 use crate::component_type_conversion::{
     convert_params, convert_result_term, encode_result, vals_to_terms,
@@ -473,6 +473,119 @@ pub fn receive_callback_result(
     token_resource.token.continue_signal.notify_one();
 
     Ok(atoms::ok())
+}
+
+/// Call an HTTP handler component
+/// This is a convenience function for components that implement wasi:http/incoming-handler
+#[rustler::nif(name = "component_call_http_handler", schedule = "DirtyCpu")]
+#[allow(clippy::type_complexity)]
+#[allow(clippy::await_holding_lock)]
+pub fn call_http_handler<'a>(
+    env: rustler::Env<'a>,
+    store_resource: ResourceArc<ComponentStoreResource>,
+    instance_resource: ResourceArc<ComponentInstanceResource>,
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: rustler::Binary,
+) -> NifResult<(u16, Vec<(String, String)>, rustler::Binary<'a>)> {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use wasmtime_wasi_http::bindings::http::types::Scheme;
+    use wasmtime_wasi_http::bindings::Proxy;
+
+    let body_bytes = body.as_slice().to_vec();
+
+    // Create a new runtime for this request
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Term(Box::new(format!("Failed to create runtime: {e}"))))?;
+
+    rt.block_on(async {
+        let mut store = store_resource.inner.lock().unwrap();
+        let instance = instance_resource.inner.lock().unwrap();
+
+        // Create the proxy interface
+        let proxy = Proxy::new(&mut *store, &instance)
+            .map_err(|e| Error::Term(Box::new(format!("Failed to create HTTP proxy: {e}"))))?;
+
+        // Build HTTP request
+        let mut request_builder = hyper::Request::builder()
+            .method(method.as_str())
+            .uri(&path)
+            .header("host", "localhost");
+
+        for (key, value) in headers {
+            request_builder = request_builder.header(key, value);
+        }
+
+        let request = request_builder
+            .body(
+                Full::new(Bytes::from(body_bytes))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .map_err(|e| Error::Term(Box::new(format!("Failed to build request: {e}"))))?;
+
+        // Create incoming request resource
+        let incoming_req = store
+            .data_mut()
+            .new_incoming_request(Scheme::Http, request)
+            .map_err(|e| {
+                Error::Term(Box::new(format!("Failed to create incoming request: {e}")))
+            })?;
+
+        // Create response outparam with channel
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let response_out = store
+            .data_mut()
+            .new_response_outparam(sender)
+            .map_err(|e| {
+                Error::Term(Box::new(format!("Failed to create response outparam: {e}")))
+            })?;
+
+        // Call the handler
+        proxy
+            .wasi_http_incoming_handler()
+            .call_handle(&mut *store, incoming_req, response_out)
+            .await
+            .map_err(|e| Error::Term(Box::new(format!("Handler call failed: {e}"))))?;
+
+        // Wait for response
+        let response = receiver
+            .await
+            .map_err(|e| Error::Term(Box::new(format!("Failed to receive response: {e}"))))?;
+
+        let response =
+            response.map_err(|e| Error::Term(Box::new(format!("Handler returned error: {e}"))))?;
+
+        // Extract status
+        let status = response.status().as_u16();
+
+        // Extract headers
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+
+        // Extract body
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| Error::Term(Box::new(format!("Failed to read response body: {e}"))))?
+            .to_bytes()
+            .to_vec();
+
+        // Convert to Elixir binary
+        let mut binary = rustler::OwnedBinary::new(body_bytes.len()).unwrap();
+        binary.as_mut_slice().copy_from_slice(&body_bytes);
+        let body_binary = binary.release(env);
+
+        Ok((status, headers, body_binary))
+    })
 }
 
 fn convert_return_values(

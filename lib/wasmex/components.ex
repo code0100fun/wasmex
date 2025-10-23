@@ -287,6 +287,53 @@ defmodule Wasmex.Components do
     GenServer.call(pid, :sync_pipe_output)
   end
 
+  @doc """
+  Calls an HTTP handler component.
+
+  This is a convenience function for components that implement the
+  `wasi:http/incoming-handler` interface.
+
+  ## Parameters
+    - pid: The component process ID
+    - method: HTTP method as string ("GET", "POST", etc.)
+    - path: Request path (e.g., "/api/users")
+    - headers: List of {name, value} header tuples
+    - body: Request body as binary
+
+  ## Returns
+    - `{:ok, {status, headers, body}}` on success where:
+      - status is the HTTP status code (integer)
+      - headers is a list of {name, value} tuples
+      - body is the response body as binary
+    - `{:error, reason}` on failure
+
+  ## Example
+      {:ok, pid} = Components.start_link(%{
+        bytes: wasm_bytes,
+        wasi: %WasiP2Options{allow_http: true}
+      })
+
+      {:ok, {status, headers, body}} = Components.call_http_handler(
+        pid,
+        "GET",
+        "/hello",
+        [{"content-type", "application/json"}],
+        ""
+      )
+  """
+  @spec call_http_handler(
+          pid(),
+          String.t(),
+          String.t(),
+          list({String.t(), String.t()}),
+          binary(),
+          pos_integer()
+        ) ::
+          {:ok, {pos_integer(), list({String.t(), String.t()}), binary()}} | {:error, any()}
+  def call_http_handler(pid, method, path, headers \\ [], body \\ "", timeout \\ 30000) do
+    GenServer.call(pid, {:call_http_handler, method, path, headers, body}, timeout)
+  end
+
   @impl true
   def init(%{store: store, component: component, imports: imports} = state) do
     case Wasmex.Components.Instance.new(store, component, imports) do
@@ -312,6 +359,25 @@ defmodule Wasmex.Components do
   def handle_call(:sync_pipe_output, _from, %{store: store} = state) do
     result = Wasmex.Native.component_sync_pipe_output(store.resource)
     # Wrap the result in :ok since the NIF returns a bare tuple
+    {:reply, {:ok, result}, state}
+  end
+
+  @impl true
+  def handle_call(
+        {:call_http_handler, method, path, headers, body},
+        _from,
+        %{store: store, instance: instance} = state
+      ) do
+    result =
+      Wasmex.Native.component_call_http_handler(
+        store.resource,
+        instance.instance_resource,
+        method,
+        path,
+        headers,
+        body
+      )
+
     {:reply, {:ok, result}, state}
   end
 
