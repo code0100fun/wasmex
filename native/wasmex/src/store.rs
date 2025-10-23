@@ -474,3 +474,73 @@ fn preopen_directory(
         .map_err(|err| Error::Term(Box::new(err.to_string())))?;
     Ok(())
 }
+
+/// Syncs captured stdout/stderr from MemoryOutputPipe to user's Pipe resources.
+/// This should be called after component execution to make captured output available.
+/// Returns (stdout_bytes_written, stderr_bytes_written).
+#[derive(rustler::NifTuple)]
+struct PipeSyncResult {
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+}
+
+#[rustler::nif(name = "component_sync_pipe_output", schedule = "DirtyCpu")]
+pub fn component_sync_pipe_output(
+    component_store_resource: ResourceArc<ComponentStoreResource>,
+) -> Result<PipeSyncResult, rustler::Error> {
+    use std::io::Write;
+
+    let mut component_store = component_store_resource.inner.lock().map_err(|e| {
+        rustler::Error::Term(Box::new(format!("Could not unlock store resource: {e}")))
+    })?;
+
+    let mut stdout_bytes_written = 0;
+    let mut stderr_bytes_written = 0;
+
+    // Take ownership of the pipes from the store (replacing with None)
+    // This allows us to consume them with try_into_inner()
+    let (stdout_memory_pipe, stdout_user_pipe, stderr_memory_pipe, stderr_user_pipe) = {
+        let store_data = component_store.data_mut();
+        (
+            store_data.stdout_pipe.take(),
+            store_data.stdout_user_pipe.clone(), // Keep user pipe reference
+            store_data.stderr_pipe.take(),
+            store_data.stderr_user_pipe.clone(), // Keep user pipe reference
+        )
+    };
+
+    // Sync stdout if both pipes are present
+    if let (Some(memory_pipe), Some(user_pipe)) = (stdout_memory_pipe, stdout_user_pipe) {
+        // Get the captured bytes
+        let bytes = memory_pipe.contents();
+
+        // Write to user's pipe
+        let mut pipe = user_pipe.pipe.lock().map_err(|e| {
+            rustler::Error::Term(Box::new(format!("Could not unlock stdout pipe: {e}")))
+        })?;
+
+        stdout_bytes_written = pipe.write(&bytes).map_err(|e| {
+            rustler::Error::Term(Box::new(format!("Failed to write to stdout pipe: {e}")))
+        })?;
+    }
+
+    // Sync stderr if both pipes are present
+    if let (Some(memory_pipe), Some(user_pipe)) = (stderr_memory_pipe, stderr_user_pipe) {
+        // Get the captured bytes
+        let bytes = memory_pipe.contents();
+
+        // Write to user's pipe
+        let mut pipe = user_pipe.pipe.lock().map_err(|e| {
+            rustler::Error::Term(Box::new(format!("Could not unlock stderr pipe: {e}")))
+        })?;
+
+        stderr_bytes_written = pipe.write(&bytes).map_err(|e| {
+            rustler::Error::Term(Box::new(format!("Failed to write to stderr pipe: {e}")))
+        })?;
+    }
+
+    Ok(PipeSyncResult {
+        stdout_bytes: stdout_bytes_written,
+        stderr_bytes: stderr_bytes_written,
+    })
+}

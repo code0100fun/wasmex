@@ -261,6 +261,32 @@ defmodule Wasmex.Components do
     GenServer.call(pid, {:call_function, name_or_path, params}, timeout)
   end
 
+  @doc """
+  Syncs captured stdout/stderr from component execution to user Pipes.
+
+  If the component was started with stdout/stderr Pipes in WasiP2Options,
+  this function will read the captured output and make it available in those Pipes.
+
+  Returns {:ok, {stdout_bytes, stderr_bytes}} indicating how many bytes were written.
+
+  ## Example
+      {:ok, stdout} = Pipe.new()
+      {:ok, pid} = Components.start_link(%{
+        bytes: wasm_bytes,
+        wasi: %WasiP2Options{stdout: stdout}
+      })
+
+      Components.call_function(pid, "some-function", [])
+      {:ok, {bytes_written, 0}} = Components.sync_pipe_output(pid)
+
+      Pipe.seek(stdout, 0)
+      output = Pipe.read(stdout)
+  """
+  @spec sync_pipe_output(pid()) :: {:ok, {non_neg_integer(), non_neg_integer()}} | {:error, any()}
+  def sync_pipe_output(pid) do
+    GenServer.call(pid, :sync_pipe_output)
+  end
+
   @impl true
   def init(%{store: store, component: component, imports: imports} = state) do
     case Wasmex.Components.Instance.new(store, component, imports) do
@@ -280,6 +306,13 @@ defmodule Wasmex.Components do
       ) do
     :ok = Wasmex.Components.Instance.call_function(instance, name, params, from)
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_call(:sync_pipe_output, _from, %{store: store} = state) do
+    result = Wasmex.Native.component_sync_pipe_output(store.resource)
+    # Wrap the result in :ok since the NIF returns a bare tuple
+    {:reply, {:ok, result}, state}
   end
 
   @impl true
