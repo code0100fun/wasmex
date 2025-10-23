@@ -208,13 +208,22 @@ defmodule Wasmex.Components do
   def start_link(opts) when is_list(opts) or is_map(opts) do
     opts = normalize_opts(opts)
 
-    with {:ok, store} <- get_store(opts),
+    with {:ok, {store, engine}} <- get_store_and_engine(opts),
          component_bytes <- get_component_bytes(opts),
          imports <- Keyword.get(opts, :imports, %{}),
-         {:ok, component} <- Wasmex.Components.Component.new(store, component_bytes) do
+         wasi_options <- Keyword.get(opts, :wasi),
+         {:ok, component} <- Wasmex.Components.Component.new(store, component_bytes),
+         {:ok, proxy_pre} <- Wasmex.Components.ProxyPre.new(store, component) do
       GenServer.start_link(
         __MODULE__,
-        %{store: store, component: component, imports: imports},
+        %{
+          store: store,
+          component: component,
+          imports: imports,
+          proxy_pre: proxy_pre,
+          engine: engine,
+          wasi_options: wasi_options
+        },
         opts
       )
     end
@@ -236,20 +245,27 @@ defmodule Wasmex.Components do
     end
   end
 
-  defp get_store(opts) do
+  defp get_store_and_engine(opts) do
     case Keyword.get(opts, :store) do
-      nil -> build_store(opts)
-      store -> {:ok, store}
+      nil -> build_store_and_engine(opts)
+      store -> {:ok, {store, nil}}
     end
   end
 
-  defp build_store(opts) do
+  defp build_store_and_engine(opts) do
     store_limits = Keyword.get(opts, :store_limits, %Wasmex.StoreLimits{})
+    engine = Wasmex.Engine.default_async()
 
-    if wasi_options = Keyword.get(opts, :wasi) do
-      Wasmex.Components.Store.new_wasi(wasi_options, store_limits)
-    else
-      Wasmex.Components.Store.new(store_limits)
+    store_result =
+      if wasi_options = Keyword.get(opts, :wasi) do
+        Wasmex.Components.Store.new_wasi(wasi_options, store_limits, engine)
+      else
+        Wasmex.Components.Store.new(store_limits, engine)
+      end
+
+    case store_result do
+      {:ok, store} -> {:ok, {store, engine}}
+      error -> error
     end
   end
 
@@ -330,15 +346,17 @@ defmodule Wasmex.Components do
           pos_integer()
         ) ::
           {:ok, {pos_integer(), list({String.t(), String.t()}), binary()}} | {:error, any()}
-  def call_http_handler(pid, method, path, headers \\ [], body \\ "", timeout \\ 30000) do
+  def call_http_handler(pid, method, path, headers \\ [], body \\ "", timeout \\ 30_000) do
     GenServer.call(pid, {:call_http_handler, method, path, headers, body}, timeout)
   end
 
   @impl true
-  def init(%{store: store, component: component, imports: imports} = state) do
+  def init(state) do
+    %{store: store, component: component, imports: imports} = state
+
     case Wasmex.Components.Instance.new(store, component, imports) do
       {:ok, instance} ->
-        {:ok, Map.merge(state, %{instance: instance, component: component, imports: imports})}
+        {:ok, Map.put(state, :instance, instance)}
 
       {:error, reason} ->
         {:error, reason}
@@ -366,12 +384,16 @@ defmodule Wasmex.Components do
   def handle_call(
         {:call_http_handler, method, path, headers, body},
         _from,
-        %{store: store, instance: instance} = state
+        %{proxy_pre: proxy_pre, engine: engine, wasi_options: wasi_options} = state
       ) do
+    # Use default WasiP2Options if none provided
+    wasi_opts = wasi_options || %Wasmex.Wasi.WasiP2Options{}
+
     result =
       Wasmex.Native.component_call_http_handler(
-        store.resource,
-        instance.instance_resource,
+        proxy_pre.resource,
+        engine.resource,
+        wasi_opts,
         method,
         path,
         headers,

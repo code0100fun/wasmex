@@ -93,10 +93,20 @@ defmodule Wasmex.Native do
   def store_or_caller_set_fuel(_store_or_caller_resource, _fuel), do: error()
 
   def component_new(_store, _component_bytes), do: error()
+  def component_proxy_pre_new(_store, _component), do: error()
   def component_instance_new(_store, _component, _imports), do: error()
   def component_call_function(_store, _instance, _function_name_path, _params, _from), do: error()
 
-  def component_call_http_handler(_store, _instance, _method, _path, _headers, _body), do: error()
+  def component_call_http_handler(
+        _proxy_pre,
+        _engine,
+        _wasi_options,
+        _method,
+        _path,
+        _headers,
+        _body
+      ),
+      do: error()
 
   def component_receive_callback_result(_component_resource, _token, _success, _result),
     do: error()

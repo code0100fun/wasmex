@@ -41,15 +41,15 @@ pub struct ExWasiOptions {
 #[derive(NifStruct)]
 #[module = "Wasmex.Wasi.WasiP2Options"]
 pub struct ExWasiP2Options {
-    args: Vec<String>,
-    env: HashMap<String, String>,
-    stdin: Option<ExPipe>,
-    stdout: Option<ExPipe>,
-    stderr: Option<ExPipe>,
-    inherit_stdin: bool,
-    inherit_stdout: bool,
-    inherit_stderr: bool,
-    allow_http: bool,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub stdin: Option<ExPipe>,
+    pub stdout: Option<ExPipe>,
+    pub stderr: Option<ExPipe>,
+    pub inherit_stdin: bool,
+    pub inherit_stdout: bool,
+    pub inherit_stderr: bool,
+    pub allow_http: bool,
 }
 
 #[derive(NifStruct)]

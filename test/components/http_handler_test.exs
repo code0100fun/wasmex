@@ -107,7 +107,6 @@ defmodule Wasmex.Components.HttpHandlerTest do
              end)
     end
 
-    @tag :skip
     test "can make multiple requests to the same component instance" do
       component_bytes = File.read!(@component_path)
 

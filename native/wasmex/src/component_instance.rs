@@ -6,7 +6,7 @@ use wit_parser::{Function, Resolve, WorldItem};
 
 use crate::atoms;
 use crate::component::ComponentResource;
-use crate::engine::TOKIO_RUNTIME;
+use crate::engine::{EngineResource, TOKIO_RUNTIME};
 use crate::store::ComponentStoreData;
 use crate::store::ComponentStoreResource;
 use rustler::types::tuple::make_tuple;
@@ -49,6 +49,14 @@ pub struct ComponentInstanceResource {
 
 #[rustler::resource_impl()]
 impl rustler::Resource for ComponentInstanceResource {}
+
+// Resource for storing ProxyPre - used for fast HTTP handler instantiation
+pub struct ProxyPreResource {
+    pub inner: Mutex<wasmtime_wasi_http::bindings::ProxyPre<ComponentStoreData>>,
+}
+
+#[rustler::resource_impl()]
+impl rustler::Resource for ProxyPreResource {}
 
 #[rustler::nif(name = "component_instance_new")]
 pub fn new_instance(
@@ -108,6 +116,50 @@ pub fn new_instance(
 
     Ok(ResourceArc::new(ComponentInstanceResource {
         inner: Mutex::new(instance),
+    }))
+}
+
+/// Create a ProxyPre for fast HTTP handler instantiation
+/// This pre-compiles the component and is used to create fresh instances per HTTP request
+#[rustler::nif(name = "component_proxy_pre_new")]
+pub fn new_proxy_pre(
+    store_resource: ResourceArc<ComponentStoreResource>,
+    component_resource: ResourceArc<ComponentResource>,
+) -> NifResult<ResourceArc<ProxyPreResource>> {
+    let store: &mut Store<ComponentStoreData> =
+        &mut *(store_resource.inner.lock().map_err(|e| {
+            rustler::Error::Term(Box::new(format!(
+                "Could not unlock store resource as the mutex was poisoned: {e}"
+            )))
+        })?);
+
+    let component = component_resource.inner.lock().map_err(|e| {
+        rustler::Error::Term(Box::new(format!(
+            "Could not unlock component resource as the mutex was poisoned: {e}"
+        )))
+    })?;
+
+    // Create linker with WASI support
+    let mut linker = Linker::new(store.engine());
+    linker.allow_shadowing(true);
+    let _ = wasmtime_wasi::p2::add_to_linker_async(&mut linker);
+
+    // Only add HTTP support if configured
+    if store.data().http.is_some() {
+        let _ = wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker);
+    }
+
+    // Pre-instantiate the component (expensive but done once)
+    let instance_pre = linker
+        .instantiate_pre(&component)
+        .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+
+    // Create ProxyPre from InstancePre
+    let proxy_pre = wasmtime_wasi_http::bindings::ProxyPre::new(instance_pre)
+        .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
+
+    Ok(ResourceArc::new(ProxyPreResource {
+        inner: Mutex::new(proxy_pre),
     }))
 }
 
@@ -475,15 +527,16 @@ pub fn receive_callback_result(
     Ok(atoms::ok())
 }
 
-/// Call an HTTP handler component
-/// This is a convenience function for components that implement wasi:http/incoming-handler
+/// Call an HTTP handler component using ProxyPre pattern
+/// Creates a fresh Store for each request to avoid state pollution between requests
 #[rustler::nif(name = "component_call_http_handler", schedule = "DirtyCpu")]
 #[allow(clippy::type_complexity)]
-#[allow(clippy::await_holding_lock)]
+#[allow(clippy::too_many_arguments)]
 pub fn call_http_handler<'a>(
     env: rustler::Env<'a>,
-    store_resource: ResourceArc<ComponentStoreResource>,
-    instance_resource: ResourceArc<ComponentInstanceResource>,
+    proxy_pre_resource: ResourceArc<ProxyPreResource>,
+    engine_resource: ResourceArc<EngineResource>,
+    wasi_options: crate::store::ExWasiP2Options,
     method: String,
     path: String,
     headers: Vec<(String, String)>,
@@ -491,26 +544,96 @@ pub fn call_http_handler<'a>(
 ) -> NifResult<(u16, Vec<(String, String)>, rustler::Binary<'a>)> {
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
+    use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
+    use wasmtime_wasi::{ResourceTable, WasiCtx};
     use wasmtime_wasi_http::bindings::http::types::Scheme;
-    use wasmtime_wasi_http::bindings::Proxy;
 
     let body_bytes = body.as_slice().to_vec();
 
-    // Create a new runtime for this request
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| Error::Term(Box::new(format!("Failed to create runtime: {e}"))))?;
+    // Use the global Tokio runtime
+    TOKIO_RUNTIME.block_on(async {
+        // Step 1: Create FRESH Store with new WASI context for this request
+        // This is the key fix - each request gets clean state
+        let engine = crate::engine::unwrap_engine(engine_resource)?;
 
-    rt.block_on(async {
-        let mut store = store_resource.inner.lock().unwrap();
-        let instance = instance_resource.inner.lock().unwrap();
+        // Build WasiCtx from options
+        let mut wasi_ctx_builder = WasiCtx::builder();
 
-        // Create the proxy interface
-        let proxy = Proxy::new(&mut *store, &instance)
-            .map_err(|e| Error::Term(Box::new(format!("Failed to create HTTP proxy: {e}"))))?;
+        for arg in &wasi_options.args {
+            wasi_ctx_builder.arg(arg);
+        }
 
-        // Build HTTP request
+        for (key, value) in &wasi_options.env {
+            wasi_ctx_builder.env(key, value);
+        }
+
+        // Handle stdout/stderr pipes (similar to store.rs)
+        let stdout_pipe = if wasi_options.stdout.is_some() {
+            let pipe = MemoryOutputPipe::new(usize::MAX);
+            let pipe_clone = pipe.clone();
+            wasi_ctx_builder.stdout(pipe);
+            Some(pipe_clone)
+        } else if wasi_options.inherit_stdout {
+            wasi_ctx_builder.inherit_stdout();
+            None
+        } else {
+            None
+        };
+
+        let stderr_pipe = if wasi_options.stderr.is_some() {
+            let pipe = MemoryOutputPipe::new(usize::MAX);
+            let pipe_clone = pipe.clone();
+            wasi_ctx_builder.stderr(pipe);
+            Some(pipe_clone)
+        } else if wasi_options.inherit_stderr {
+            wasi_ctx_builder.inherit_stderr();
+            None
+        } else {
+            None
+        };
+
+        let wasi_ctx = wasi_ctx_builder.build();
+
+        // Create fresh HTTP context if needed
+        let http_ctx = if wasi_options.allow_http {
+            Some(wasmtime_wasi_http::WasiHttpCtx::new())
+        } else {
+            None
+        };
+
+        // Create fresh Store with new state
+        let mut store = Store::new(
+            &engine,
+            ComponentStoreData {
+                http: http_ctx,
+                ctx: Some(wasi_ctx),
+                limits: wasmtime::StoreLimits::default(),
+                table: ResourceTable::new(),
+                stdout_pipe: stdout_pipe.clone(),
+                stderr_pipe: stderr_pipe.clone(),
+                stdout_user_pipe: None,
+                stderr_user_pipe: None,
+            },
+        );
+        store.limiter(|state| &mut state.limits);
+
+        // Step 2: Instantiate proxy from ProxyPre (fast - microseconds!)
+        // Clone ProxyPre out of mutex to avoid holding lock across await
+        let proxy_pre = {
+            let guard = proxy_pre_resource
+                .inner
+                .lock()
+                .map_err(|e| Error::Term(Box::new(format!("Failed to lock ProxyPre: {e}"))))?;
+            guard.clone()
+        }; // MutexGuard dropped here
+
+        let proxy = proxy_pre.instantiate_async(&mut store).await.map_err(|e| {
+            Error::Term(Box::new(format!(
+                "Failed to instantiate from ProxyPre: {e}"
+            )))
+        })?;
+
+        // Step 3: Build HTTP request
         let mut request_builder = hyper::Request::builder()
             .method(method.as_str())
             .uri(&path)
@@ -545,32 +668,28 @@ pub fn call_http_handler<'a>(
                 Error::Term(Box::new(format!("Failed to create response outparam: {e}")))
             })?;
 
-        // Call the handler
+        // Step 4: Call the handler
         proxy
             .wasi_http_incoming_handler()
-            .call_handle(&mut *store, incoming_req, response_out)
+            .call_handle(&mut store, incoming_req, response_out)
             .await
             .map_err(|e| Error::Term(Box::new(format!("Handler call failed: {e}"))))?;
 
-        // Wait for response
+        // Step 5: Wait for response
         let response = receiver
             .await
-            .map_err(|e| Error::Term(Box::new(format!("Failed to receive response: {e}"))))?;
+            .map_err(|e| Error::Term(Box::new(format!("Failed to receive response: {e}"))))?
+            .map_err(|e| Error::Term(Box::new(format!("Handler returned error: {e}"))))?;
 
-        let response =
-            response.map_err(|e| Error::Term(Box::new(format!("Handler returned error: {e}"))))?;
-
-        // Extract status
+        // Step 6: Process response
         let status = response.status().as_u16();
 
-        // Extract headers
         let headers: Vec<(String, String)> = response
             .headers()
             .iter()
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
 
-        // Extract body
         let body_bytes = response
             .into_body()
             .collect()
