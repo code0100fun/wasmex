@@ -220,11 +220,16 @@ pub fn component_store_new(
     } else {
         StoreLimits::default()
     };
+
+    // Initialize a default WasiCtx for backward compatibility.
+    // Components may use WASI P2 stdio even without explicit WASI options.
+    let ctx = WasiCtx::builder().build();
+
     let mut store = Store::new(
         &engine,
         ComponentStoreData {
             http: None,
-            ctx: None,
+            ctx: Some(ctx),
             limits,
             table: wasmtime_wasi::ResourceTable::new(),
             stdout_pipe: None,

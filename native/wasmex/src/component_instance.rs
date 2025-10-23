@@ -197,32 +197,38 @@ pub fn call_exported_function(
     let from = thread_env.save(from);
 
     TOKIO_RUNTIME.spawn(async move {
-        // Execute function and get the result
-        let result = component_execute_function(
-            &mut thread_env,
-            component_store_resource,
-            instance_resource,
-            function_name_path,
-            function_params,
-        );
+        // Use spawn_blocking to run WASM execution in a thread pool without an active
+        // Tokio runtime. This prevents "Cannot start a runtime from within a runtime"
+        // errors when WASI P2 operations try to block on async I/O.
+        let _ = tokio::task::spawn_blocking(move || {
+            // Execute function and get the result
+            let result = component_execute_function(
+                &mut thread_env,
+                component_store_resource,
+                instance_resource,
+                function_name_path,
+                function_params,
+            );
 
-        // Send result directly to the caller
-        thread_env.run(|env| {
-            let from_tuple = from.load(env).decode::<Term>().unwrap();
-            let result_term = result
-                .load(env)
-                .decode::<Term>()
-                .unwrap_or(atoms::error().encode(env));
+            // Send result directly to the caller
+            thread_env.run(|env| {
+                let from_tuple = from.load(env).decode::<Term>().unwrap();
+                let result_term = result
+                    .load(env)
+                    .decode::<Term>()
+                    .unwrap_or(atoms::error().encode(env));
 
-            // GenServer.call from tuple is {pid, ref}
-            // LocalPid in Rustler can handle both local and remote PIDs (despite the name)
-            let (caller_pid, ref_term) = from_tuple
-                .decode::<(LocalPid, Term)>()
-                .expect("from must be a GenServer {pid, ref} tuple");
+                // GenServer.call from tuple is {pid, ref}
+                // LocalPid in Rustler can handle both local and remote PIDs (despite the name)
+                let (caller_pid, ref_term) = from_tuple
+                    .decode::<(LocalPid, Term)>()
+                    .expect("from must be a GenServer {pid, ref} tuple");
 
-            // Send GenServer reply format directly to caller: {ref, result}
-            let _ = env.send(&caller_pid, make_tuple(env, &[ref_term, result_term]));
-        });
+                // Send GenServer reply format directly to caller: {ref, result}
+                let _ = env.send(&caller_pid, make_tuple(env, &[ref_term, result_term]));
+            });
+        })
+        .await;
     });
 
     atoms::ok()
