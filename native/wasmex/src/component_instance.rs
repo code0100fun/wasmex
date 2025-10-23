@@ -71,9 +71,9 @@ pub fn new_instance(
 
     let mut linker = Linker::new(store.engine());
     linker.allow_shadowing(true);
-    let _ = wasmtime_wasi::p2::add_to_linker_sync(&mut linker);
+    let _ = wasmtime_wasi::p2::add_to_linker_async(&mut linker);
     if store.data().http.is_some() {
-        let _ = wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker);
+        let _ = wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker);
     }
 
     // Instantiate the component
@@ -100,8 +100,10 @@ pub fn new_instance(
         }
     }
 
-    let instance = linker
-        .instantiate(&mut *store, &component)
+    // Use async instantiation with async linker
+    // We block_on here since new_instance is a sync NIF called during setup (not hot path)
+    let instance = TOKIO_RUNTIME
+        .block_on(linker.instantiate_async(&mut *store, &component))
         .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
 
     Ok(ResourceArc::new(ComponentInstanceResource {
@@ -197,18 +199,23 @@ pub fn call_exported_function(
     let from = thread_env.save(from);
 
     TOKIO_RUNTIME.spawn(async move {
-        // Use spawn_blocking to run WASM execution in a thread pool without an active
-        // Tokio runtime. This prevents "Cannot start a runtime from within a runtime"
-        // errors when WASI P2 operations try to block on async I/O.
+        // Use spawn_blocking to run async wasmtime operations
+        // This allows holding std::sync::MutexGuard across awaits
+        // while using wasmtime's native async APIs
         let _ = tokio::task::spawn_blocking(move || {
-            // Execute function and get the result
-            let result = component_execute_function(
+            // Create a single-threaded runtime for this execution
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create runtime");
+
+            let result = rt.block_on(component_execute_function_async(
                 &mut thread_env,
                 component_store_resource,
                 instance_resource,
                 function_name_path,
                 function_params,
-            );
+            ));
 
             // Send result directly to the caller
             thread_env.run(|env| {
@@ -234,28 +241,40 @@ pub fn call_exported_function(
     atoms::ok()
 }
 
-fn component_execute_function(
+// We hold MutexGuard across await points intentionally here.
+// This function runs inside spawn_blocking with a local runtime,
+// so the standard async-aware Mutex isn't applicable.
+#[allow(clippy::await_holding_lock)]
+async fn component_execute_function_async(
     thread_env: &mut OwnedEnv,
     component_store_resource: ResourceArc<ComponentStoreResource>,
     instance_resource: ResourceArc<ComponentInstanceResource>,
     function_name_path: Vec<String>,
     function_params: SavedTerm,
 ) -> SavedTerm {
-    let result = thread_env.run(|env| {
-        let component_store: &mut Store<ComponentStoreData> =
-            &mut (component_store_resource.inner.lock().unwrap());
-        let instance = &mut instance_resource.inner.lock().unwrap();
-
-        let given_params = match function_params.load(env).decode::<Vec<Term>>() {
-            Ok(vec) => vec,
-            Err(err) => {
-                return env
+    // Step 1: Decode parameters inside thread_env.run()
+    let given_params =
+        thread_env.run(
+            |env| match function_params.load(env).decode::<Vec<Term>>() {
+                Ok(vec) => Ok(vec),
+                Err(err) => Err(env
                     .error_tuple(format!("could not load 'function params': {err:?}"))
-                    .encode(env)
-            }
-        };
+                    .encode(env)),
+            },
+        );
 
-        // reduce function_name_path to a lookup index by iterating over function_name_path and calling instance.get_export
+    let given_params = match given_params {
+        Ok(params) => params,
+        Err(err_term) => return thread_env.save(err_term),
+    };
+
+    // Step 2: Lock resources, find function, prepare for async call
+    // We need to scope the locks to ensure they're dropped before the await
+    let (function, param_types, results_count) = {
+        let mut component_store = component_store_resource.inner.lock().unwrap();
+        let instance = instance_resource.inner.lock().unwrap();
+
+        // Find function by path
         let mut lookup_index = None;
         for (index, name) in function_name_path.iter().enumerate() {
             if let Some(inner) = lookup_index {
@@ -269,94 +288,107 @@ fn component_execute_function(
             }
 
             if lookup_index.is_none() {
-                if function_name_path.len() == 1 {
-                    return env
-                        .error_tuple(format!(
-                            "exported function `{}` not found.",
-                            function_name_path.join(", ")
-                        ))
-                        .encode(env);
+                let err_msg = if function_name_path.len() == 1 {
+                    format!(
+                        "exported function `{}` not found.",
+                        function_name_path.join(", ")
+                    )
                 } else {
-                    return env
-                        .error_tuple(format!(
+                    format!(
                         "exported function `[{}]` not found. Could not find `{}` at position {}",
                         function_name_path.join(", "),
                         name,
                         index
-                    ))
-                        .encode(env);
-                }
+                    )
+                };
+                return thread_env.run(|env| thread_env.save(env.error_tuple(err_msg).encode(env)));
             }
         }
 
         let lookup_index = match lookup_index {
             Some(index) => index,
             None => {
-                return env
-                    .error_tuple(format!(
-                        "exported function `{}` not found.",
-                        function_name_path.join(", ")
-                    ))
-                    .encode(env);
+                let err_msg = format!(
+                    "exported function `{}` not found.",
+                    function_name_path.join(", ")
+                );
+                return thread_env.run(|env| thread_env.save(env.error_tuple(err_msg).encode(env)));
             }
         };
 
-        let function_result = instance.get_func(&mut *component_store, lookup_index);
-        let function = match function_result {
+        let function = match instance.get_func(&mut *component_store, lookup_index) {
             Some(func) => func,
             None => {
-                return env
-                    .error_tuple(format!(
-                        "exported function `{}` not found",
-                        function_name_path.join(", ")
-                    ))
-                    .encode(env)
+                let err_msg = format!(
+                    "exported function `{}` not found",
+                    function_name_path.join(", ")
+                );
+                return thread_env.run(|env| thread_env.save(env.error_tuple(err_msg).encode(env)));
             }
         };
 
-        let param_types = function.params(&mut *component_store);
-        let param_types = param_types
-            .as_ref()
-            .iter()
-            .map(|x| x.1.clone())
-            .collect::<Vec<Type>>();
-
-        let converted_params = match convert_params(param_types.as_ref(), given_params) {
-            Ok(params) => params,
-            Err(Error::Term(e)) => {
-                return env.error_tuple(e.encode(env)).encode(env);
-            }
-            Err(e) => {
-                let reason = format!("Error converting param: {e:?}");
-                return env.error_tuple(&reason).encode(env);
-            }
-        };
+        let param_types = function.params(&*component_store);
+        let param_types: Vec<Type> = param_types.as_ref().iter().map(|x| x.1.clone()).collect();
         let results_count = function.results(&*component_store).len();
 
-        let mut result = vec![Val::Bool(false); results_count];
-        match function.call(
-            &mut *component_store,
-            converted_params.as_slice(),
-            &mut result,
-        ) {
-            Ok(_) => {
-                let _ = function.post_return(&mut *component_store);
-                encode_result(env, result)
-            }
-            Err(err) => {
-                let reason = format!("{err}");
-                if let Ok(trap) = err.downcast::<Trap>() {
-                    env.error_tuple(format!(
-                        "Error during function excecution ({trap}): {reason}"
-                    ))
-                } else {
-                    env.error_tuple(format!("Error during function excecution: {reason}"))
+        (function, param_types, results_count)
+        // MutexGuards are dropped here, before any await
+    };
+
+    // Step 3: Convert parameters inside thread_env.run()
+    let converted_params =
+        thread_env.run(
+            |env| match convert_params(param_types.as_ref(), given_params) {
+                Ok(params) => Ok(params),
+                Err(Error::Term(e)) => Err(env.error_tuple(e.encode(env)).encode(env)),
+                Err(e) => {
+                    let reason = format!("Error converting param: {e:?}");
+                    Err(env.error_tuple(&reason).encode(env))
                 }
+            },
+        );
+
+    let converted_params = match converted_params {
+        Ok(params) => params,
+        Err(err_term) => return thread_env.save(err_term),
+    };
+
+    // Step 4: Re-lock and call function asynchronously
+    // Lock scope: lock -> async call -> drop before encoding
+    let result_vals = {
+        let mut component_store = component_store_resource.inner.lock().unwrap();
+        let mut result = vec![Val::Bool(false); results_count];
+
+        match function
+            .call_async(
+                &mut *component_store,
+                converted_params.as_slice(),
+                &mut result,
+            )
+            .await
+        {
+            Ok(_) => {
+                let _ = function.post_return_async(&mut *component_store).await;
+                Ok(result)
             }
+            Err(err) => Err(err),
         }
-        .encode(env)
-    });
-    thread_env.save(result)
+        // MutexGuard dropped here
+    };
+
+    // Step 5: Encode result inside thread_env.run()
+    match result_vals {
+        Ok(result) => thread_env.run(|env| thread_env.save(encode_result(env, result).encode(env))),
+        Err(err) => {
+            let reason = format!("{err}");
+            let err_msg = if let Ok(trap) = err.downcast::<Trap>() {
+                format!("Error during function excecution ({trap}): {reason}")
+            } else {
+                format!("Error during function excecution: {reason}")
+            };
+            thread_env.run(|env| thread_env.save(env.error_tuple(err_msg).encode(env)))
+        }
+    }
 }
 
 #[rustler::nif(name = "component_receive_callback_result")]

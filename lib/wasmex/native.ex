@@ -27,6 +27,7 @@ defmodule Wasmex.Native do
     force_build: System.get_env("WASMEX_BUILD") in ["1", "true"]
 
   def engine_new(_engine_config), do: error()
+  def engine_new_async(_engine_config), do: error()
   def engine_precompile_module(_engine_resource, _bytes), do: error()
 
   def module_compile(_store_or_caller_resource, _bytes), do: error()

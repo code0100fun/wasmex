@@ -15,7 +15,8 @@ defmodule Wasmex.Components.Store do
   end
 
   def new(store_limits \\ nil, engine \\ nil) do
-    %Engine{resource: engine_resource} = engine || Engine.default()
+    # Components use async engine by default for proper WASI P2 support
+    %Engine{resource: engine_resource} = engine || Engine.default_async()
 
     case Wasmex.Native.component_store_new(
            store_limits,
@@ -27,7 +28,8 @@ defmodule Wasmex.Components.Store do
   end
 
   def new_wasi(%WasiP2Options{} = options \\ %WasiP2Options{}, store_limits \\ nil, engine \\ nil) do
-    %Engine{resource: engine_resource} = engine || Engine.default()
+    # Components use async engine by default for proper WASI P2 support
+    %Engine{resource: engine_resource} = engine || Engine.default_async()
 
     case Wasmex.Native.component_store_new_wasi(
            options,

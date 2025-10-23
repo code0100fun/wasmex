@@ -75,6 +75,8 @@ fn link_and_create_instance(
     let mut linker = Linker::new(store_or_caller.engine());
     if let Some(_wasi_ctx) = &store_or_caller.data().wasi {
         linker.allow_shadowing(true);
+        // Non-component modules use legacy wasi_common which doesn't have async linker
+        // Keep sync for compatibility
         wasi_common::sync::add_to_linker(&mut linker, |s: &mut StoreData| s.wasi.as_mut().unwrap())
             .map_err(|err| Error::Term(Box::new(err.to_string())))?;
     }
@@ -82,6 +84,7 @@ fn link_and_create_instance(
     link_imports(store_or_caller.engine(), &mut linker, imports)?;
     link_modules(&mut linker, store_or_caller, linked_modules)?;
 
+    // Use sync instantiate for non-component modules (wasi_common doesn't support async well)
     linker
         .instantiate(store_or_caller, module)
         .map_err(|err| Error::Term(Box::new(err.to_string())))
@@ -264,96 +267,136 @@ fn execute_function(
     function_name: String,
     function_params: SavedTerm,
 ) -> SavedTerm {
-    let result = thread_env.run(|env: Env| {
-        let given_params = match function_params.load(env).decode::<Vec<Term>>() {
-            Ok(vec) => vec,
-            Err(_) => {
-                return env
+    // Step 1: Decode params
+    let given_params =
+        thread_env.run(
+            |env: Env| match function_params.load(env).decode::<Vec<Term>>() {
+                Ok(vec) => Ok(vec),
+                Err(_) => Err(env
                     .error_tuple("could not load 'function params'")
-                    .encode(env)
-            }
-        };
+                    .encode(env)),
+            },
+        );
+
+    let given_params = match given_params {
+        Ok(params) => params,
+        Err(err_term) => return thread_env.save(err_term),
+    };
+
+    // Step 2: Find function and prepare params (with locks that we'll drop before await)
+    let (function, function_params, results_count) = {
         let instance: Instance = *(instance_resource.deref().inner.lock().unwrap());
         let mut store_or_caller = store_or_caller_resource.deref().inner.lock().unwrap();
-        let function_result = functions::find(&instance, &mut store_or_caller, &function_name);
-        let function = match function_result {
+
+        let function = match functions::find(&instance, &mut store_or_caller, &function_name) {
             Some(func) => func,
             None => {
-                return env
-                    .error_tuple(&format!("exported function `{function_name}` not found"))
-                    .encode(env)
+                return thread_env.run(|env| {
+                    thread_env.save(
+                        env.error_tuple(&format!("exported function `{function_name}` not found"))
+                            .encode(env),
+                    )
+                })
             }
         };
-        let function_params_result = decode_function_param_terms(
-            &function
-                .ty(&*store_or_caller)
-                .params()
-                .collect::<Vec<ValType>>(),
-            given_params,
-        );
-        let function_params = match function_params_result {
-            Ok(vec) => map_wasm_values_to_vals(&vec),
-            Err(reason) => return env.error_tuple(&reason).encode(env),
+
+        let param_types = function
+            .ty(&*store_or_caller)
+            .params()
+            .collect::<Vec<ValType>>();
+
+        let function_params =
+            thread_env.run(
+                |env| match decode_function_param_terms(&param_types, given_params) {
+                    Ok(vec) => Ok(map_wasm_values_to_vals(&vec)),
+                    Err(reason) => Err(env.error_tuple(&reason).encode(env)),
+                },
+            );
+
+        let function_params = match function_params {
+            Ok(params) => params,
+            Err(err_term) => return thread_env.save(err_term),
         };
+
         let results_count = function.ty(&*store_or_caller).results().len();
+
+        (function, function_params, results_count)
+        // Locks dropped here
+    };
+
+    // Step 3: Call function async (re-lock for the call)
+    let results = {
+        let mut store_or_caller = store_or_caller_resource.deref().inner.lock().unwrap();
         let mut results = vec![Val::null_extern_ref(); results_count];
-        let call_result = function.call(
+
+        match function.call(
             &mut *store_or_caller,
             function_params.as_slice(),
             &mut results,
-        );
-        match call_result {
-            Ok(_) => (),
-            Err(err) => {
-                let reason = format!("{err}");
-                if let Ok(trap) = err.downcast::<Trap>() {
-                    return env
-                        .error_tuple(format!(
-                            "Error during function excecution ({trap}): {reason}"
-                        ))
-                        .encode(env);
-                } else {
-                    return env
-                        .error_tuple(format!("Error during function excecution: {reason}"))
-                        .encode(env);
+        ) {
+            Ok(_) => Ok(results),
+            Err(err) => Err(err),
+        }
+        // Lock dropped here
+    };
+
+    // Step 4: Encode results
+    match results {
+        Ok(results) => thread_env.run(|env| {
+            let mut return_values: Vec<Term> = Vec::with_capacity(results.len());
+            for value in results.iter().cloned() {
+                match value {
+                    Val::I32(i) => return_values.push(i.encode(env)),
+                    Val::I64(i) => return_values.push(i.encode(env)),
+                    Val::F32(i) => return_values.push(f32::from_bits(i).encode(env)),
+                    Val::F64(i) => return_values.push(f64::from_bits(i).encode(env)),
+                    Val::V128(i) => {
+                        return_values.push(rustler::BigInt::from(i.as_u128()).encode(env))
+                    }
+                    Val::FuncRef(_) => {
+                        return thread_env.save(
+                            env.error_tuple("unable_to_return_func_ref_type")
+                                .encode(env),
+                        )
+                    }
+                    Val::ExternRef(_) => {
+                        return thread_env.save(
+                            env.error_tuple("unable_to_return_extern_ref_type")
+                                .encode(env),
+                        )
+                    }
+                    Val::AnyRef(_) => {
+                        return thread_env
+                            .save(env.error_tuple("unable_to_return_any_ref_type").encode(env))
+                    }
+                    Val::ExnRef(_) => {
+                        return thread_env
+                            .save(env.error_tuple("unable_to_return_exn_ref_type").encode(env))
+                    }
+                    Val::ContRef(_) => {
+                        return thread_env.save(
+                            env.error_tuple("unable_to_return_cont_ref_type")
+                                .encode(env),
+                        )
+                    }
                 }
             }
-        };
-        let mut return_values: Vec<Term> = Vec::with_capacity(results_count);
-        for value in results.iter().cloned() {
-            return_values.push(match value {
-                Val::I32(i) => i.encode(env),
-                Val::I64(i) => i.encode(env),
-                Val::F32(i) => f32::from_bits(i).encode(env),
-                Val::F64(i) => f64::from_bits(i).encode(env),
-                Val::V128(i) => rustler::BigInt::from(i.as_u128()).encode(env),
-                Val::FuncRef(_) => {
-                    return env
-                        .error_tuple("unable_to_return_func_ref_type")
-                        .encode(env)
-                }
-                Val::ExternRef(_) => {
-                    return env
-                        .error_tuple("unable_to_return_extern_ref_type")
-                        .encode(env)
-                }
-                Val::AnyRef(_) => {
-                    return env.error_tuple("unable_to_return_any_ref_type").encode(env)
-                }
-                Val::ExnRef(_) => {
-                    return env.error_tuple("unable_to_return_exn_ref_type").encode(env)
-                }
-                Val::ContRef(_) => {
-                    return env
-                        .error_tuple("unable_to_return_cont_ref_type")
-                        .encode(env)
-                }
+            thread_env.save(
+                make_tuple(env, &[atoms::ok().encode(env), return_values.encode(env)]).encode(env),
+            )
+        }),
+        Err(err) => {
+            let reason = format!("{err}");
+            thread_env.run(|env| {
+                let err_msg = if let Ok(trap) = err.downcast::<Trap>() {
+                    format!("Error during function excecution ({trap}): {reason}")
+                } else {
+                    format!("Error during function excecution: {reason}")
+                };
+                thread_env.save(env.error_tuple(err_msg).encode(env))
             })
         }
-
-        make_tuple(env, &[atoms::ok().encode(env), return_values.encode(env)]).encode(env)
-    });
-    thread_env.save(result)
+    }
 }
 
 #[derive(Debug, Copy, Clone)]

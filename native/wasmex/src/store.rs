@@ -110,9 +110,14 @@ pub struct ComponentStoreData {
     pub(crate) http: Option<WasiHttpCtx>,
     pub(crate) limits: StoreLimits,
     pub(crate) table: ResourceTable,
+    // Infrastructure for Phase 3: reading captured stdout/stderr from pipes
+    #[allow(dead_code)]
     pub(crate) stdout_pipe: Option<MemoryOutputPipe>,
+    #[allow(dead_code)]
     pub(crate) stderr_pipe: Option<MemoryOutputPipe>,
+    #[allow(dead_code)]
     pub(crate) stdout_user_pipe: Option<ResourceArc<PipeResource>>,
+    #[allow(dead_code)]
     pub(crate) stderr_user_pipe: Option<ResourceArc<PipeResource>>,
 }
 

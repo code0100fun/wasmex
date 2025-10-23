@@ -5,7 +5,7 @@ defmodule Wasmex.WasmComponentsTest do
   alias Wasmex.Wasi.WasiP2Options
 
   test "bring your own store with debug info enabled" do
-    {:ok, engine} = Wasmex.Engine.new(%EngineConfig{debug_info: true})
+    {:ok, engine} = Wasmex.Engine.new_async(%EngineConfig{debug_info: true})
 
     {:ok, store} =
       Wasmex.Components.Store.new_wasi(

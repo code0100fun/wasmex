@@ -50,6 +50,19 @@ pub fn new(
     Ok(resource)
 }
 
+#[rustler::nif(name = "engine_new_async")]
+pub fn new_async(
+    engine_config_ex: ExEngineConfig,
+) -> Result<ResourceArc<EngineResource>, rustler::Error> {
+    let config = engine_config_async(engine_config_ex);
+    let engine = Engine::new(&config).map_err(|err| Error::Term(Box::new(err.to_string())))?;
+    let resource = ResourceArc::new(EngineResource {
+        inner: Mutex::new(engine),
+    });
+
+    Ok(resource)
+}
+
 #[rustler::nif(name = "engine_precompile_module", schedule = "DirtyCpu")]
 pub fn precompile_module<'a>(
     env: rustler::Env<'a>,
@@ -70,6 +83,14 @@ pub fn precompile_module<'a>(
 }
 
 pub(crate) fn engine_config(engine_config: ExEngineConfig) -> Config {
+    engine_config_with_async(engine_config, false)
+}
+
+pub(crate) fn engine_config_async(engine_config: ExEngineConfig) -> Config {
+    engine_config_with_async(engine_config, true)
+}
+
+fn engine_config_with_async(engine_config: ExEngineConfig, enable_async: bool) -> Config {
     let backtrace_details = match engine_config.wasm_backtrace_details {
         true => WasmBacktraceDetails::Enable,
         false => WasmBacktraceDetails::Disable,
@@ -89,6 +110,11 @@ pub(crate) fn engine_config(engine_config: ExEngineConfig) -> Config {
     config.wasm_memory64(engine_config.memory64);
     config.wasm_component_model(engine_config.wasm_component_model);
     config.debug_info(engine_config.debug_info);
+
+    // Enable async support only when requested (for component model with WASI P2)
+    if enable_async {
+        config.async_support(true);
+    }
 
     config
 }

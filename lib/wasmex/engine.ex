@@ -67,6 +67,39 @@ defmodule Wasmex.Engine do
   end
 
   @doc ~S"""
+  Creates a new async-enabled `Wasmex.Engine` with the specified options.
+
+  This engine has async support enabled, which is required for WASI P2 components
+  that use async I/O operations. Use this for component model execution.
+
+  ## Example
+
+      iex> {:ok, _engine} = Wasmex.Engine.new_async(%Wasmex.EngineConfig{})
+  """
+  @spec new_async(EngineConfig.t()) :: {:ok, __MODULE__.t()} | {:error, binary()}
+  def new_async(%EngineConfig{} = config) do
+    case Wasmex.Native.engine_new_async(config) do
+      {:error, err} -> {:error, err}
+      resource -> {:ok, __wrap_resource__(resource)}
+    end
+  end
+
+  @doc ~S"""
+  Creates a new async-enabled `Wasmex.Engine` with default settings.
+
+  This engine has async support enabled for WASI P2 components.
+
+  ## Example
+
+      iex> _engine = Wasmex.Engine.default_async()
+  """
+  @spec default_async() :: __MODULE__.t()
+  def default_async() do
+    {:ok, engine} = new_async(%EngineConfig{})
+    engine
+  end
+
+  @doc ~S"""
   Ahead-of-time (AOT) compiles a WebAssembly module.
 
   The `bytes` provided must be in one of two formats:

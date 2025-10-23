@@ -48,6 +48,7 @@ defmodule Wasmex.WasiP2PipeCaptureTest do
         )
 
       # Should not crash with inherit mode
+      # Note: Inherited output goes directly to OS file descriptors and can't be captured by capture_io
       assert {:ok, "printed to stdout"} =
                Wasmex.Components.call_function(pid, "print-hello", [])
     end
@@ -68,6 +69,7 @@ defmodule Wasmex.WasiP2PipeCaptureTest do
         )
 
       # Should work with mixed mode
+      # Note: Inherited stderr goes directly to OS file descriptors and can't be captured by capture_io
       assert {:ok, "printed to both"} =
                Wasmex.Components.call_function(pid, "print-mixed", [])
     end
