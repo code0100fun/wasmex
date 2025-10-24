@@ -119,6 +119,11 @@ pub struct ComponentStoreData {
     pub(crate) stdout_user_pipe: Option<ResourceArc<PipeResource>>,
     #[allow(dead_code)]
     pub(crate) stderr_user_pipe: Option<ResourceArc<PipeResource>>,
+    // Track position in memory pipes to only sync new data
+    #[allow(dead_code)]
+    pub(crate) stdout_position: Option<usize>,
+    #[allow(dead_code)]
+    pub(crate) stderr_position: Option<usize>,
 }
 
 impl WasiHttpView for ComponentStoreData {
@@ -241,6 +246,8 @@ pub fn component_store_new(
             stderr_pipe: None,
             stdout_user_pipe: None,
             stderr_user_pipe: None,
+            stdout_position: None,
+            stderr_position: None,
         },
     );
     store.limiter(|state| &mut state.limits);
@@ -330,6 +337,8 @@ pub fn component_store_new_wasi(
             stderr_pipe: stderr_pipe_ref,
             stdout_user_pipe: stdout_user_pipe_ref,
             stderr_user_pipe: stderr_user_pipe_ref,
+            stdout_position: None,
+            stderr_position: None,
         },
     );
     store.limiter(|state| &mut state.limits);
@@ -497,46 +506,76 @@ pub fn component_sync_pipe_output(
     let mut stdout_bytes_written = 0;
     let mut stderr_bytes_written = 0;
 
-    // Take ownership of the pipes from the store (replacing with None)
-    // This allows us to consume them with try_into_inner()
-    let (stdout_memory_pipe, stdout_user_pipe, stderr_memory_pipe, stderr_user_pipe) = {
-        let store_data = component_store.data_mut();
+    // Access the store data to read pipe positions
+    let (stdout_pos, stderr_pos) = {
+        let store_data = component_store.data();
         (
-            store_data.stdout_pipe.take(),
-            store_data.stdout_user_pipe.clone(), // Keep user pipe reference
-            store_data.stderr_pipe.take(),
-            store_data.stderr_user_pipe.clone(), // Keep user pipe reference
+            store_data.stdout_position.unwrap_or(0),
+            store_data.stderr_position.unwrap_or(0),
         )
     };
 
+    // Borrow the pipes from the store (don't take ownership)
+    let store_data = component_store.data_mut();
+
     // Sync stdout if both pipes are present
-    if let (Some(memory_pipe), Some(user_pipe)) = (stdout_memory_pipe, stdout_user_pipe) {
-        // Get the captured bytes
-        let bytes = memory_pipe.contents();
+    if let (Some(memory_pipe), Some(user_pipe)) = (
+        store_data.stdout_pipe.as_ref(),
+        store_data.stdout_user_pipe.as_ref(),
+    ) {
+        // Get ALL the captured bytes
+        let all_bytes = memory_pipe.contents();
 
-        // Write to user's pipe
-        let mut pipe = user_pipe.pipe.lock().map_err(|e| {
-            rustler::Error::Term(Box::new(format!("Could not unlock stdout pipe: {e}")))
-        })?;
+        // Only write the NEW bytes (from saved position to end)
+        let new_bytes = if stdout_pos < all_bytes.len() {
+            &all_bytes[stdout_pos..]
+        } else {
+            &[]
+        };
 
-        stdout_bytes_written = pipe.write(&bytes).map_err(|e| {
-            rustler::Error::Term(Box::new(format!("Failed to write to stdout pipe: {e}")))
-        })?;
+        if !new_bytes.is_empty() {
+            // Write new bytes to user's pipe
+            let mut pipe = user_pipe.pipe.lock().map_err(|e| {
+                rustler::Error::Term(Box::new(format!("Could not unlock stdout pipe: {e}")))
+            })?;
+
+            stdout_bytes_written = pipe.write(new_bytes).map_err(|e| {
+                rustler::Error::Term(Box::new(format!("Failed to write to stdout pipe: {e}")))
+            })?;
+        }
+
+        // Update the position for next sync
+        store_data.stdout_position = Some(all_bytes.len());
     }
 
     // Sync stderr if both pipes are present
-    if let (Some(memory_pipe), Some(user_pipe)) = (stderr_memory_pipe, stderr_user_pipe) {
-        // Get the captured bytes
-        let bytes = memory_pipe.contents();
+    if let (Some(memory_pipe), Some(user_pipe)) = (
+        store_data.stderr_pipe.as_ref(),
+        store_data.stderr_user_pipe.as_ref(),
+    ) {
+        // Get ALL the captured bytes
+        let all_bytes = memory_pipe.contents();
 
-        // Write to user's pipe
-        let mut pipe = user_pipe.pipe.lock().map_err(|e| {
-            rustler::Error::Term(Box::new(format!("Could not unlock stderr pipe: {e}")))
-        })?;
+        // Only write the NEW bytes (from saved position to end)
+        let new_bytes = if stderr_pos < all_bytes.len() {
+            &all_bytes[stderr_pos..]
+        } else {
+            &[]
+        };
 
-        stderr_bytes_written = pipe.write(&bytes).map_err(|e| {
-            rustler::Error::Term(Box::new(format!("Failed to write to stderr pipe: {e}")))
-        })?;
+        if !new_bytes.is_empty() {
+            // Write new bytes to user's pipe
+            let mut pipe = user_pipe.pipe.lock().map_err(|e| {
+                rustler::Error::Term(Box::new(format!("Could not unlock stderr pipe: {e}")))
+            })?;
+
+            stderr_bytes_written = pipe.write(new_bytes).map_err(|e| {
+                rustler::Error::Term(Box::new(format!("Failed to write to stderr pipe: {e}")))
+            })?;
+        }
+
+        // Update the position for next sync
+        store_data.stderr_position = Some(all_bytes.len());
     }
 
     Ok(PipeSyncResult {

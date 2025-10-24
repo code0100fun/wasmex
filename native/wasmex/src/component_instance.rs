@@ -617,6 +617,8 @@ pub fn call_http_handler<'a>(
                 stderr_pipe: stderr_pipe.clone(),
                 stdout_user_pipe,
                 stderr_user_pipe,
+                stdout_position: None,
+                stderr_position: None,
             },
         );
         store.limiter(|state| &mut state.limits);
