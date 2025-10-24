@@ -112,6 +112,7 @@ defmodule Wasmex.Native do
     do: error()
 
   def wit_exported_functions(_path, _wit), do: error()
+  def component_metadata(_wasm_bytes), do: error()
 
   def wat_to_wasm(_wat), do: error()
 
