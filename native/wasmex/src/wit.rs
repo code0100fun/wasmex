@@ -46,7 +46,7 @@ pub fn component_metadata<'a>(
 
     // Extract exported functions with full signatures
     let mut exported_functions = Vec::new();
-    for (key, item) in &world.exports {
+    for (_key, item) in &world.exports {
         match item {
             // Direct function export at world level
             WorldItem::Function(func) => {
@@ -63,15 +63,16 @@ pub fn component_metadata<'a>(
                     None => String::new(),
                 };
 
-                // Convert WorldKey to string representation
-                let interface_name = format!("{:?}", key);
+                // Direct exports don't have an interface - use empty string
+                let interface_name = String::new();
 
                 exported_functions.push((func.name.clone(), params, returns, interface_name));
             }
             // Interface export - extract functions from the interface
             WorldItem::Interface { id, .. } => {
                 let interface = &resolve.interfaces[*id];
-                let interface_name = format!("{:?}", key);
+                // Get the fully qualified interface name
+                let interface_name = interface_to_qualified_name(&resolve, *id);
 
                 // Extract all functions from this interface
                 for (_func_name, func) in &interface.functions {
@@ -137,6 +138,40 @@ pub fn component_metadata<'a>(
         .collect();
 
     Ok(functions_list.encode(env))
+}
+
+/// Get the fully qualified name for an interface
+fn interface_to_qualified_name(resolve: &Resolve, interface_id: wit_parser::InterfaceId) -> String {
+    let interface = &resolve.interfaces[interface_id];
+
+    // Get the package and interface name
+    if let Some(package_id) = interface.package {
+        let package = &resolve.packages[package_id];
+        let package_name = &package.name;
+
+        // Format as namespace:package/interface@version
+        if let Some(iface_name) = &interface.name {
+            format!(
+                "{}:{}/{}@{}",
+                package_name.namespace,
+                package_name.name,
+                iface_name,
+                package_name
+                    .version
+                    .as_ref()
+                    .map(|v| format!("{}.{}.{}", v.major, v.minor, v.patch))
+                    .unwrap_or_else(|| "0.0.0".to_string())
+            )
+        } else {
+            format!("{}:{}", package_name.namespace, package_name.name)
+        }
+    } else {
+        // No package, just use the interface name if available
+        interface
+            .name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    }
 }
 
 /// Convert a WIT type to a string representation
